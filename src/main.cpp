@@ -1,0 +1,359 @@
+// micro-ROS /cmd_vel -> Farm-ng Amiga CAN bridge, running on the Arduino Portenta H7 (M7 core).
+//
+// Wiring / operational prerequisites:
+//  - Portenta CAN-H/CAN-L (FDCAN2, broken out on the high-density connector; the Portenta
+//    Breakout / Machine Control carriers expose it directly) must be tied into the Amiga's
+//    250 kbit/s CAN bus alongside the dashboard/VCU.
+//  - The Amiga must first be armed into Auto Mode from the physical dashboard/pendant.
+//    Until the VCU reports STATE_AUTO_ACTIVE over CAN, this node keeps commanding zero
+//    speed even though it continuously requests STATE_AUTO_ACTIVE.
+//  - Requires a carrier with wired Ethernet (e.g. Portenta Mid Carrier / Machine Control).
+//    Connect a micro-ROS agent reachable on the same network, e.g.:
+//      ros2 run micro_ros_agent micro_ros_agent udp4 --port 8888
+//
+// micro_ros_platformio ships a ready-made "ethernet" transport, but it's hard-wired to the
+// ESP32 (ETH.h + WiFi.h) and won't build for the Portenta. board_microros_transport is set
+// to "custom" below and the UDP transport is implemented here instead, using the Portenta's
+// own Ethernet/EthernetUDP classes -- same approach as micro_ros_platformio's own wifi
+// transport, just swapped onto a wired interface.
+//
+// CAN protocol reference: farm-ng/farm-ng-amiga, py/farm_ng/canbus/packet.py
+// (AmigaRpdo1 / AmigaTpdo1, CANopen PDO cob-ids offset by the dashboard node id).
+
+#include <Arduino.h>
+#include <Arduino_CAN.h>
+#include <Ethernet.h>
+
+#include <micro_ros_platformio.h>
+#include <rcl/rcl.h>
+#include <rcl/error_handling.h>
+#include <rclc/rclc.h>
+#include <rclc/executor.h>
+#include <rmw_microros/rmw_microros.h>
+#include <uxr/client/util/time.h>
+#include <uxr/client/profile/transport/custom/custom_transport.h>
+
+#include <geometry_msgs/msg/twist.h>
+
+// --- Network configuration ---
+static IPAddress const PORTENTA_IP(10, 95, 76, 6);
+static IPAddress const PORTENTA_SUBNET(255, 255, 255, 0);
+static IPAddress const PORTENTA_GATEWAY(10, 95, 76, 254);
+static IPAddress const MICRO_ROS_AGENT_IP(10, 95, 76, 166);
+static uint16_t constexpr MICRO_ROS_AGENT_PORT = 8888;
+
+// Returns false (rather than hanging in error_loop()) so a failed create_entities() is
+// simply retried by the WAITING_AGENT/AGENT_AVAILABLE reconnection state machine below.
+#define RCCHECK(fn)                                                                                                  \
+  {                                                                                                                  \
+    rcl_ret_t temp_rc = fn;                                                                                          \
+    if (temp_rc != RCL_RET_OK) { return false; }                                                                     \
+  }
+#define RCSOFTCHECK(fn)                                                                                              \
+  {                                                                                                                  \
+    rcl_ret_t temp_rc = fn;                                                                                          \
+    (void)temp_rc;                                                                                                   \
+  }
+// Official micro-ROS reconnection idiom: run X at most once per MS milliseconds.
+#define EXECUTE_EVERY_N_MS(MS, X)                                                                                    \
+  do {                                                                                                               \
+    static volatile int64_t init = -1;                                                                              \
+    if (init == -1) { init = uxr_millis(); }                                                                        \
+    if (uxr_millis() - init > MS) { X; init = uxr_millis(); }                                                        \
+  } while (0)
+
+// --- Farm-ng Amiga CAN protocol ---
+static uint8_t constexpr DASHBOARD_NODE_ID = 0x0E;
+static uint32_t constexpr AMIGA_RPDO1_CAN_ID = 0x200 + DASHBOARD_NODE_ID; // commands -> VCU
+static uint32_t constexpr AMIGA_TPDO1_CAN_ID = 0x180 + DASHBOARD_NODE_ID; // state <- VCU
+
+enum class AmigaControlState : uint8_t
+{
+  STATE_BOOT = 0,
+  STATE_MANUAL_READY = 1,
+  STATE_MANUAL_ACTIVE = 2,
+  STATE_CC_ACTIVE = 3,
+  STATE_AUTO_READY = 4,
+  STATE_AUTO_ACTIVE = 5,
+  STATE_ESTOPPED = 6,
+};
+
+// --- Safety limits ---
+static float constexpr MAX_LINEAR_SPEED_MPS = 1.0f;         // clamp for cmd_vel.linear.x, raise deliberately
+static float constexpr MAX_ANGULAR_RATE_RPS = 1.0f;          // clamp for cmd_vel.angular.z
+static unsigned long constexpr CMD_VEL_TIMEOUT_MS = 500;     // stop if /cmd_vel goes silent
+static unsigned long constexpr CAN_SEND_INTERVAL_MS = 50;    // 20 Hz, matches farm-ng reference firmware
+
+rclc_executor_t executor;
+rclc_support_t support;
+rcl_allocator_t allocator;
+rcl_node_t node;
+rcl_subscription_t cmd_vel_subscriber;
+geometry_msgs__msg__Twist cmd_vel_msg;
+
+volatile float g_linear_x = 0.0f;
+volatile float g_angular_z = 0.0f;
+volatile unsigned long g_last_cmd_vel_ms = 0;
+volatile uint8_t g_vcu_state = static_cast<uint8_t>(AmigaControlState::STATE_BOOT);
+
+enum AgentState
+{
+  WAITING_AGENT,
+  AGENT_AVAILABLE,
+  AGENT_CONNECTED,
+  AGENT_DISCONNECTED
+};
+AgentState g_state = WAITING_AGENT;
+
+void error_loop()
+{
+  while (true)
+  {
+    digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
+    delay(100);
+  }
+}
+
+void cmd_vel_callback(const void * msgin)
+{
+  const geometry_msgs__msg__Twist * msg = reinterpret_cast<const geometry_msgs__msg__Twist *>(msgin);
+
+  g_linear_x = constrain(static_cast<float>(msg->linear.x), -MAX_LINEAR_SPEED_MPS, MAX_LINEAR_SPEED_MPS);
+  g_angular_z = constrain(static_cast<float>(msg->angular.z), -MAX_ANGULAR_RATE_RPS, MAX_ANGULAR_RATE_RPS);
+  g_last_cmd_vel_ms = millis();
+}
+
+void send_amiga_rpdo1(AmigaControlState state_req, float cmd_speed, float cmd_ang_rate)
+{
+  int16_t const speed_mm_s = static_cast<int16_t>(cmd_speed * 1000.0f);
+  int16_t const ang_mrad_s = static_cast<int16_t>(cmd_ang_rate * 1000.0f);
+
+  uint8_t data[8];
+  data[0] = static_cast<uint8_t>(state_req);
+  data[1] = static_cast<uint8_t>(speed_mm_s & 0xFF);
+  data[2] = static_cast<uint8_t>((speed_mm_s >> 8) & 0xFF);
+  data[3] = static_cast<uint8_t>(ang_mrad_s & 0xFF);
+  data[4] = static_cast<uint8_t>((ang_mrad_s >> 8) & 0xFF);
+  data[5] = 0x00; // pto_bits, unused
+  data[6] = 0x00; // hbridge_bits, unused
+  data[7] = 0x00; // padding, matches AmigaRpdo1 wire format
+
+  CanMsg const msg(CanStandardId(AMIGA_RPDO1_CAN_ID), sizeof(data), data);
+  CAN.write(msg);
+}
+
+void poll_can_feedback()
+{
+  while (CAN.available())
+  {
+    CanMsg const msg = CAN.read();
+    if (msg.isStandardId() && msg.getStandardId() == AMIGA_TPDO1_CAN_ID && msg.data_length >= 1)
+    {
+      g_vcu_state = msg.data[0];
+    }
+  }
+}
+
+// --- micro-ROS custom UDP transport over the Portenta's wired Ethernet ---
+struct micro_ros_agent_locator
+{
+  IPAddress address;
+  int port;
+};
+
+static EthernetUDP udp_client;
+
+extern "C" {
+
+bool platformio_transport_open(struct uxrCustomTransport * transport)
+{
+  struct micro_ros_agent_locator * locator = reinterpret_cast<struct micro_ros_agent_locator *>(transport->args);
+  return udp_client.begin(locator->port) == 1;
+}
+
+bool platformio_transport_close(struct uxrCustomTransport * transport)
+{
+  (void)transport;
+  udp_client.stop();
+  return true;
+}
+
+size_t platformio_transport_write(
+    struct uxrCustomTransport * transport, const uint8_t * buf, size_t len, uint8_t * errcode)
+{
+  struct micro_ros_agent_locator * locator = reinterpret_cast<struct micro_ros_agent_locator *>(transport->args);
+
+  size_t sent = 0;
+  if (udp_client.beginPacket(locator->address, locator->port))
+  {
+    sent = udp_client.write(buf, len);
+    sent = udp_client.endPacket() ? sent : 0;
+  }
+  udp_client.flush();
+
+  *errcode = (sent == len) ? 0 : 1;
+  return sent;
+}
+
+size_t platformio_transport_read(
+    struct uxrCustomTransport * transport, uint8_t * buf, size_t len, int timeout, uint8_t * errcode)
+{
+  (void)transport;
+
+  int64_t const start_time = uxr_millis();
+  while ((uxr_millis() - start_time) < static_cast<int64_t>(timeout) && udp_client.parsePacket() == 0)
+  {
+    delay(1);
+  }
+
+  size_t available = 0;
+  if (udp_client.available())
+  {
+    available = udp_client.read(buf, len);
+  }
+
+  *errcode = (available > 0) ? 0 : 1;
+  return available;
+}
+
+} // extern "C"
+
+// Brings up the wired Ethernet link with the static address above and registers the UDP
+// transport with micro-ROS. Runs once from setup(); the reconnection state machine in
+// loop() only needs to (re)create rcl entities afterwards, not redo the network config.
+void setup_micro_ros_transport()
+{
+  Ethernet.begin(nullptr, PORTENTA_IP, PORTENTA_GATEWAY, PORTENTA_GATEWAY, PORTENTA_SUBNET);
+
+  unsigned long const link_wait_start = millis();
+  while (Ethernet.linkStatus() != LinkON && (millis() - link_wait_start) < 5000)
+  {
+    delay(100);
+  }
+
+  Serial.print("Ethernet link: ");
+  Serial.println(Ethernet.linkStatus() == LinkON ? "UP" : "DOWN (continuing anyway)");
+  Serial.print("Portenta IP: ");
+  Serial.println(PORTENTA_IP);
+
+  static struct micro_ros_agent_locator locator;
+  locator.address = MICRO_ROS_AGENT_IP;
+  locator.port = MICRO_ROS_AGENT_PORT;
+
+  rmw_uros_set_custom_transport(
+      false, reinterpret_cast<void *>(&locator), platformio_transport_open, platformio_transport_close,
+      platformio_transport_write, platformio_transport_read);
+}
+
+// Brings up node/subscription/executor against the currently available agent.
+// Returns false (via RCCHECK) on any failure, leaving cleanup to destroy_entities().
+bool create_entities()
+{
+  allocator = rcl_get_default_allocator();
+
+  RCCHECK(rclc_support_init(&support, 0, NULL, &allocator));
+  RCCHECK(rclc_node_init_default(&node, "amiga_cmd_vel_bridge", "", &support));
+
+  RCCHECK(rclc_subscription_init_default(
+      &cmd_vel_subscriber, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, Twist), "cmd_vel"));
+
+  executor = rclc_executor_get_zero_initialized_executor();
+  RCCHECK(rclc_executor_init(&executor, &support.context, 1, &allocator));
+  RCCHECK(
+      rclc_executor_add_subscription(&executor, &cmd_vel_subscriber, &cmd_vel_msg, &cmd_vel_callback, ON_NEW_DATA));
+
+  // Reset the watchdog window so a just-completed (re)connect isn't immediately
+  // treated as a stale /cmd_vel.
+  g_last_cmd_vel_ms = millis();
+  return true;
+}
+
+void destroy_entities()
+{
+  rmw_context_t * rmw_context = rcl_context_get_rmw_context(&support.context);
+  (void)rmw_uros_set_context_entity_destroy_session_timeout(rmw_context, 0);
+
+  rcl_subscription_fini(&cmd_vel_subscriber, &node);
+  rclc_executor_fini(&executor);
+  rcl_node_fini(&node);
+  rclc_support_fini(&support);
+}
+
+void setup()
+{
+  Serial.begin(115200);
+  delay(2000);
+
+  pinMode(LED_BUILTIN, OUTPUT);
+
+  setup_micro_ros_transport();
+
+  if (!CAN.begin(CanBitRate::BR_250k))
+  {
+    error_loop();
+  }
+
+  g_state = WAITING_AGENT;
+}
+
+void loop()
+{
+  // micro-ROS agent reconnection state machine (official micro-ROS pattern): detect
+  // agent loss/return via rmw_uros_ping_agent and rebuild entities on reconnect.
+  switch (g_state)
+  {
+    case WAITING_AGENT:
+      EXECUTE_EVERY_N_MS(500, g_state = (RMW_RET_OK == rmw_uros_ping_agent(100, 1)) ? AGENT_AVAILABLE : WAITING_AGENT;);
+      break;
+
+    case AGENT_AVAILABLE:
+      g_state = create_entities() ? AGENT_CONNECTED : WAITING_AGENT;
+      if (g_state == WAITING_AGENT)
+      {
+        destroy_entities();
+      }
+      break;
+
+    case AGENT_CONNECTED:
+      EXECUTE_EVERY_N_MS(
+          200, g_state = (RMW_RET_OK == rmw_uros_ping_agent(100, 1)) ? AGENT_CONNECTED : AGENT_DISCONNECTED;);
+      if (g_state == AGENT_CONNECTED)
+      {
+        RCSOFTCHECK(rclc_executor_spin_some(&executor, RCL_MS_TO_NS(10)));
+      }
+      break;
+
+    case AGENT_DISCONNECTED:
+      destroy_entities();
+      g_state = WAITING_AGENT;
+      break;
+  }
+
+  // CAN bridge runs unconditionally, independent of micro-ROS connection state, so the
+  // watchdog below drops the Amiga to zero speed as soon as /cmd_vel goes stale --
+  // whether that's because the publisher stopped or because the agent link itself dropped.
+  poll_can_feedback();
+
+  static unsigned long last_can_send_ms = 0;
+  unsigned long const now = millis();
+
+  if (now - last_can_send_ms >= CAN_SEND_INTERVAL_MS)
+  {
+    last_can_send_ms = now;
+
+    bool const cmd_vel_fresh = (now - g_last_cmd_vel_ms) < CMD_VEL_TIMEOUT_MS;
+    bool const vcu_active = g_vcu_state == static_cast<uint8_t>(AmigaControlState::STATE_AUTO_ACTIVE);
+
+    float speed = 0.0f;
+    float ang_rate = 0.0f;
+    if (cmd_vel_fresh && vcu_active)
+    {
+      speed = g_linear_x;
+      ang_rate = g_angular_z;
+    }
+
+    // Always request AUTO_ACTIVE: the VCU only grants it once Auto Mode has been armed
+    // from the physical dashboard/pendant, mirroring farm-ng's own reference firmware.
+    send_amiga_rpdo1(AmigaControlState::STATE_AUTO_ACTIVE, speed, ang_rate);
+  }
+}

@@ -1,9 +1,12 @@
 // micro-ROS /cmd_vel -> Farm-ng Amiga CAN bridge, running on the Arduino Portenta H7 (M7 core).
+// Also publishes /imu/data (sensor_msgs/Imu) from a BNO085 wired over I2C.
 //
 // Wiring / operational prerequisites:
 //  - Portenta CAN-H/CAN-L (FDCAN2, broken out on the high-density connector; the Portenta
 //    Breakout / Machine Control carriers expose it directly) must be tied into the Amiga's
 //    250 kbit/s CAN bus alongside the dashboard/VCU.
+//  - BNO085 wired to the Portenta's I2C2 bus (Wire2, PH_11/PH_12; 3V3, GND, SDA, SCL),
+//    address 0x4A (ADR low). No reset line is used.
 //  - The Amiga must first be armed into Auto Mode from the physical dashboard/pendant.
 //    Until the VCU reports STATE_AUTO_ACTIVE over CAN, this node keeps commanding zero
 //    speed even though it continuously requests STATE_AUTO_ACTIVE.
@@ -23,6 +26,8 @@
 #include <Arduino.h>
 #include <Arduino_CAN.h>
 #include <Ethernet.h>
+#include <Wire.h>
+#include <Adafruit_BNO08x.h>
 
 #include <micro_ros_platformio.h>
 #include <rcl/rcl.h>
@@ -32,15 +37,17 @@
 #include <rmw_microros/rmw_microros.h>
 #include <uxr/client/util/time.h>
 #include <uxr/client/profile/transport/custom/custom_transport.h>
+#include <micro_ros_utilities/string_utilities.h>
 
 #include <geometry_msgs/msg/twist.h>
+#include <sensor_msgs/msg/imu.h>
 
 // --- Network configuration ---
 static IPAddress const PORTENTA_IP(10, 95, 76, 6);
 static IPAddress const PORTENTA_SUBNET(255, 255, 255, 0);
 static IPAddress const PORTENTA_GATEWAY(10, 95, 76, 254);
 static IPAddress const MICRO_ROS_AGENT_IP(10, 95, 76, 166);
-static uint16_t constexpr MICRO_ROS_AGENT_PORT = 8888;
+static uint16_t constexpr MICRO_ROS_AGENT_PORT = 8889;
 
 // Returns false (rather than hanging in error_loop()) so a failed create_entities() is
 // simply retried by the WAITING_AGENT/AGENT_AVAILABLE reconnection state machine below.
@@ -84,17 +91,40 @@ static float constexpr MAX_ANGULAR_RATE_RPS = 1.0f;          // clamp for cmd_ve
 static unsigned long constexpr CMD_VEL_TIMEOUT_MS = 500;     // stop if /cmd_vel goes silent
 static unsigned long constexpr CAN_SEND_INTERVAL_MS = 50;    // 20 Hz, matches farm-ng reference firmware
 
+// --- BNO085 IMU (I2C) ---
+// Wired to the Portenta's I2C2 bus (Wire2 -- PH_11/PH_12, distinct from the default Wire on
+// D11/D12): 3V3, GND, SDA, SCL. No reset line is used (-1); the BNO085's I2C address is 0x4A
+// with ADR tied low.
+static int8_t constexpr BNO08X_RESET_PIN = -1;
+static uint32_t constexpr BNO08X_REPORT_INTERVAL_US = 10000; // 100 Hz sensor reports
+static unsigned long constexpr IMU_PUBLISH_INTERVAL_MS = 20; // 50 Hz publish rate (timer-driven)
+
+// Rough placeholders derived from the BNO085 datasheet's typical dynamic accuracy, not a
+// per-unit calibration: ~3 deg orientation, ~0.02 rad/s gyro noise, ~0.08 m/s^2 accel noise.
+static double constexpr IMU_ORIENTATION_VARIANCE = 0.0025;
+static double constexpr IMU_ANGULAR_VELOCITY_VARIANCE = 0.0004;
+static double constexpr IMU_LINEAR_ACCELERATION_VARIANCE = 0.0064;
+
 rclc_executor_t executor;
 rclc_support_t support;
 rcl_allocator_t allocator;
 rcl_node_t node;
 rcl_subscription_t cmd_vel_subscriber;
 geometry_msgs__msg__Twist cmd_vel_msg;
+rcl_publisher_t imu_publisher;
+rcl_timer_t imu_timer;
+sensor_msgs__msg__Imu imu_msg;
 
 volatile float g_linear_x = 0.0f;
 volatile float g_angular_z = 0.0f;
 volatile unsigned long g_last_cmd_vel_ms = 0;
 volatile uint8_t g_vcu_state = static_cast<uint8_t>(AmigaControlState::STATE_BOOT);
+
+Adafruit_BNO08x bno08x(BNO08X_RESET_PIN);
+volatile bool g_imu_orientation_valid = false;
+volatile float g_imu_qw = 1.0f, g_imu_qx = 0.0f, g_imu_qy = 0.0f, g_imu_qz = 0.0f;
+volatile float g_imu_gx = 0.0f, g_imu_gy = 0.0f, g_imu_gz = 0.0f;
+volatile float g_imu_ax = 0.0f, g_imu_ay = 0.0f, g_imu_az = 0.0f;
 
 enum AgentState
 {
@@ -152,6 +182,85 @@ void poll_can_feedback()
       g_vcu_state = msg.data[0];
     }
   }
+}
+
+// Enables the three SH2 reports the Imu message is built from. Must be re-armed after every
+// sensor reset (power-on, or a runtime reset reported via bno08x.wasReset()) since the BNO085
+// forgets its report configuration when that happens.
+void configure_bno08x_reports()
+{
+  bno08x.enableReport(SH2_ROTATION_VECTOR, BNO08X_REPORT_INTERVAL_US);
+  bno08x.enableReport(SH2_GYROSCOPE_CALIBRATED, BNO08X_REPORT_INTERVAL_US);
+  bno08x.enableReport(SH2_ACCELEROMETER, BNO08X_REPORT_INTERVAL_US);
+}
+
+// Drains at most one pending SH2 report per call (matches the Adafruit_BNO08x examples) and
+// caches it into the g_imu_* globals; imu_timer_callback() reads those back on its own schedule.
+void poll_bno08x()
+{
+  if (bno08x.wasReset())
+  {
+    configure_bno08x_reports();
+  }
+
+  sh2_SensorValue_t event;
+  if (!bno08x.getSensorEvent(&event))
+  {
+    return;
+  }
+
+  switch (event.sensorId)
+  {
+    case SH2_ROTATION_VECTOR:
+      g_imu_qw = event.un.rotationVector.real;
+      g_imu_qx = event.un.rotationVector.i;
+      g_imu_qy = event.un.rotationVector.j;
+      g_imu_qz = event.un.rotationVector.k;
+      g_imu_orientation_valid = true;
+      break;
+    case SH2_GYROSCOPE_CALIBRATED:
+      g_imu_gx = event.un.gyroscope.x;
+      g_imu_gy = event.un.gyroscope.y;
+      g_imu_gz = event.un.gyroscope.z;
+      break;
+    case SH2_ACCELEROMETER:
+      g_imu_ax = event.un.accelerometer.x;
+      g_imu_ay = event.un.accelerometer.y;
+      g_imu_az = event.un.accelerometer.z;
+      break;
+    default:
+      break;
+  }
+}
+
+// Timer callback (added to the executor below): stamps and publishes the latest cached
+// BNO085 readings at a fixed rate, independent of the sensor's own (asynchronous) report cadence.
+void imu_timer_callback(rcl_timer_t * timer, int64_t last_call_time)
+{
+  (void)last_call_time;
+  if (timer == NULL || !g_imu_orientation_valid)
+  {
+    return;
+  }
+
+  int64_t const now_ns = rmw_uros_epoch_nanos();
+  imu_msg.header.stamp.sec = static_cast<int32_t>(now_ns / 1000000000LL);
+  imu_msg.header.stamp.nanosec = static_cast<uint32_t>(now_ns % 1000000000LL);
+
+  imu_msg.orientation.w = g_imu_qw;
+  imu_msg.orientation.x = g_imu_qx;
+  imu_msg.orientation.y = g_imu_qy;
+  imu_msg.orientation.z = g_imu_qz;
+
+  imu_msg.angular_velocity.x = g_imu_gx;
+  imu_msg.angular_velocity.y = g_imu_gy;
+  imu_msg.angular_velocity.z = g_imu_gz;
+
+  imu_msg.linear_acceleration.x = g_imu_ax;
+  imu_msg.linear_acceleration.y = g_imu_ay;
+  imu_msg.linear_acceleration.z = g_imu_az;
+
+  RCSOFTCHECK(rcl_publish(&imu_publisher, &imu_msg, NULL));
 }
 
 // --- micro-ROS custom UDP transport over the Portenta's wired Ethernet ---
@@ -256,11 +365,20 @@ bool create_entities()
 
   RCCHECK(rclc_subscription_init_default(
       &cmd_vel_subscriber, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, Twist), "cmd_vel"));
+  RCCHECK(rclc_publisher_init_default(
+      &imu_publisher, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, Imu), "imu/data"));
+  RCCHECK(rclc_timer_init_default2(
+      &imu_timer, &support, RCL_MS_TO_NS(IMU_PUBLISH_INTERVAL_MS), &imu_timer_callback, true));
 
   executor = rclc_executor_get_zero_initialized_executor();
-  RCCHECK(rclc_executor_init(&executor, &support.context, 1, &allocator));
+  RCCHECK(rclc_executor_init(&executor, &support.context, 2, &allocator));
   RCCHECK(
       rclc_executor_add_subscription(&executor, &cmd_vel_subscriber, &cmd_vel_msg, &cmd_vel_callback, ON_NEW_DATA));
+  RCCHECK(rclc_executor_add_timer(&executor, &imu_timer));
+
+  // Best-effort; a synced epoch just makes imu_msg.header.stamp meaningful, it's not required
+  // for the bridge to function.
+  RCSOFTCHECK(rmw_uros_sync_session(1000));
 
   // Reset the watchdog window so a just-completed (re)connect isn't immediately
   // treated as a stale /cmd_vel.
@@ -274,6 +392,8 @@ void destroy_entities()
   (void)rmw_uros_set_context_entity_destroy_session_timeout(rmw_context, 0);
 
   rcl_subscription_fini(&cmd_vel_subscriber, &node);
+  rcl_publisher_fini(&imu_publisher, &node);
+  rcl_timer_fini(&imu_timer);
   rclc_executor_fini(&executor);
   rcl_node_fini(&node);
   rclc_support_fini(&support);
@@ -292,6 +412,32 @@ void setup()
   {
     error_loop();
   }
+
+  Wire2.begin();
+  if (!bno08x.begin_I2C(BNO08x_I2CADDR_DEFAULT, &Wire2))
+  {
+    error_loop();
+  }
+  configure_bno08x_reports();
+
+  // Static parts of imu_msg: allocated/assigned once so create_entities()/destroy_entities()
+  // (called repeatedly by the reconnection state machine) don't touch them.
+  imu_msg.header.frame_id = micro_ros_string_utilities_init("imu_link");
+  for (size_t i = 0; i < 9; ++i)
+  {
+    imu_msg.orientation_covariance[i] = 0.0;
+    imu_msg.angular_velocity_covariance[i] = 0.0;
+    imu_msg.linear_acceleration_covariance[i] = 0.0;
+  }
+  imu_msg.orientation_covariance[0] = IMU_ORIENTATION_VARIANCE;
+  imu_msg.orientation_covariance[4] = IMU_ORIENTATION_VARIANCE;
+  imu_msg.orientation_covariance[8] = IMU_ORIENTATION_VARIANCE;
+  imu_msg.angular_velocity_covariance[0] = IMU_ANGULAR_VELOCITY_VARIANCE;
+  imu_msg.angular_velocity_covariance[4] = IMU_ANGULAR_VELOCITY_VARIANCE;
+  imu_msg.angular_velocity_covariance[8] = IMU_ANGULAR_VELOCITY_VARIANCE;
+  imu_msg.linear_acceleration_covariance[0] = IMU_LINEAR_ACCELERATION_VARIANCE;
+  imu_msg.linear_acceleration_covariance[4] = IMU_LINEAR_ACCELERATION_VARIANCE;
+  imu_msg.linear_acceleration_covariance[8] = IMU_LINEAR_ACCELERATION_VARIANCE;
 
   g_state = WAITING_AGENT;
 }
@@ -333,6 +479,10 @@ void loop()
   // watchdog below drops the Amiga to zero speed as soon as /cmd_vel goes stale --
   // whether that's because the publisher stopped or because the agent link itself dropped.
   poll_can_feedback();
+
+  // Likewise, keep draining the BNO085 regardless of connection state so imu_timer_callback()
+  // always has a fresh reading to publish as soon as the agent (re)connects.
+  poll_bno08x();
 
   static unsigned long last_can_send_ms = 0;
   unsigned long const now = millis();

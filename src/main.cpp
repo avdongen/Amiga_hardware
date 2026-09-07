@@ -1,5 +1,8 @@
 // micro-ROS /cmd_vel -> Farm-ng Amiga CAN bridge, running on the Arduino Portenta H7 (M7 core).
-// Also publishes /imu/data (sensor_msgs/Imu) from a BNO085 wired over I2C.
+// Also publishes /imu/data (sensor_msgs/Imu) from a BNO085 wired over I2C, and
+// /wheel/odometry (nav_msgs/Odometry, dead-reckoned from the VCU's measured wheel speed/turn
+// rate over CAN) -- meant as a twist-only input to robot_localization's EKF, see the
+// WHEEL_ODOM_* comments below for why its pose covariance is deliberately pessimistic.
 //
 // Wiring / operational prerequisites:
 //  - Portenta CAN-H/CAN-L (FDCAN2, broken out on the high-density connector; the Portenta
@@ -41,12 +44,13 @@
 
 #include <geometry_msgs/msg/twist.h>
 #include <sensor_msgs/msg/imu.h>
+#include <nav_msgs/msg/odometry.h>
 
 // --- Network configuration ---
 static IPAddress const PORTENTA_IP(10, 95, 76, 6);
 static IPAddress const PORTENTA_SUBNET(255, 255, 255, 0);
 static IPAddress const PORTENTA_GATEWAY(10, 95, 76, 254);
-static IPAddress const MICRO_ROS_AGENT_IP(10, 95, 76, 166);
+static IPAddress const MICRO_ROS_AGENT_IP(10, 95, 76, 165);
 static uint16_t constexpr MICRO_ROS_AGENT_PORT = 8889;
 
 // Returns false (rather than hanging in error_loop()) so a failed create_entities() is
@@ -91,6 +95,26 @@ static float constexpr MAX_ANGULAR_RATE_RPS = 1.0f;          // clamp for cmd_ve
 static unsigned long constexpr CMD_VEL_TIMEOUT_MS = 500;     // stop if /cmd_vel goes silent
 static unsigned long constexpr CAN_SEND_INTERVAL_MS = 50;    // 20 Hz, matches farm-ng reference firmware
 
+// --- Wheel odometry (from AmigaTpdo1's measured speed/turn-rate, i.e. the VCU's own
+// wheel-encoder-derived body velocity estimate -- there is no separate raw per-wheel CAN
+// telemetry on the dashboard-facing bus) ---
+static unsigned long constexpr WHEEL_ODOM_PUBLISH_INTERVAL_MS = 50; // 20 Hz, matches VCU feedback rate
+static double constexpr WHEEL_ODOM_MAX_VALID_DT_S = 1.0; // guards against millis() wrap / stale first sample
+
+// Placeholder measurement noise for the twist (what's actually estimated from wheel speed):
+// ~5 cm/s and ~1.7 deg/s std dev. vy/vz/roll/pitch are treated as known-zero (planar,
+// no-side-slip assumption) rather than "unknown", hence their tiny variance below.
+static double constexpr WHEEL_ODOM_LINEAR_X_VARIANCE = 0.0025;
+static double constexpr WHEEL_ODOM_ANGULAR_Z_VARIANCE = 0.0009;
+static double constexpr WHEEL_ODOM_CONSTRAINED_VARIANCE = 1.0e-6;
+
+// The integrated x/y/yaw pose drifts unboundedly with distance travelled (no absolute
+// reference), so its covariance below is deliberately pessimistic. Feed this into
+// robot_localization as a twist-only source (differential odometry) -- e.g. in the ekf yaml,
+// set the pose fields of this odom0_config to false and only fuse vx/vyaw from twist -- rather
+// than trusting pose.pose directly.
+static double constexpr WHEEL_ODOM_POSE_XY_YAW_VARIANCE = 1.0;
+
 // --- BNO085 IMU (I2C) ---
 // Wired to the Portenta's I2C2 bus (Wire2 -- PH_11/PH_12, distinct from the default Wire on
 // D11/D12): 3V3, GND, SDA, SCL. No reset line is used (-1); the BNO085's I2C address is 0x4A
@@ -114,11 +138,22 @@ geometry_msgs__msg__Twist cmd_vel_msg;
 rcl_publisher_t imu_publisher;
 rcl_timer_t imu_timer;
 sensor_msgs__msg__Imu imu_msg;
+rcl_publisher_t wheel_odom_publisher;
+rcl_timer_t wheel_odom_timer;
+nav_msgs__msg__Odometry wheel_odom_msg;
 
 volatile float g_linear_x = 0.0f;
 volatile float g_angular_z = 0.0f;
 volatile unsigned long g_last_cmd_vel_ms = 0;
 volatile uint8_t g_vcu_state = static_cast<uint8_t>(AmigaControlState::STATE_BOOT);
+
+volatile bool g_wheel_odom_valid = false;
+volatile unsigned long g_last_tpdo1_ms = 0;
+volatile float g_meas_linear_mps = 0.0f;  // VCU-measured body-frame forward speed
+volatile float g_meas_angular_rps = 0.0f; // VCU-measured body-frame yaw rate
+volatile double g_odom_x = 0.0;
+volatile double g_odom_y = 0.0;
+volatile double g_odom_theta = 0.0;
 
 Adafruit_BNO08x bno08x(BNO08X_RESET_PIN);
 volatile bool g_imu_orientation_valid = false;
@@ -172,6 +207,34 @@ void send_amiga_rpdo1(AmigaControlState state_req, float cmd_speed, float cmd_an
   CAN.write(msg);
 }
 
+// Integrates the VCU's measured body velocity (from a just-decoded AmigaTpdo1 frame) into a
+// dead-reckoned 2D pose, using the elapsed time since the previous TPDO1 frame as dt. Skips
+// the very first sample (no baseline dt yet) and any implausible dt (millis() wrap, or a long
+// CAN gap) rather than integrating garbage.
+void integrate_wheel_odometry(float linear_mps, float angular_rps)
+{
+  unsigned long const now_ms = millis();
+
+  if (g_wheel_odom_valid)
+  {
+    double const dt = (now_ms - g_last_tpdo1_ms) / 1000.0;
+    if (dt > 0.0 && dt < WHEEL_ODOM_MAX_VALID_DT_S)
+    {
+      // Midpoint integration: advance heading by half the step before applying it to x/y.
+      double const delta_theta = angular_rps * dt;
+      double const theta_mid = g_odom_theta + delta_theta * 0.5;
+      g_odom_x += linear_mps * cos(theta_mid) * dt;
+      g_odom_y += linear_mps * sin(theta_mid) * dt;
+      g_odom_theta = atan2(sin(g_odom_theta + delta_theta), cos(g_odom_theta + delta_theta));
+    }
+  }
+
+  g_meas_linear_mps = linear_mps;
+  g_meas_angular_rps = angular_rps;
+  g_last_tpdo1_ms = now_ms;
+  g_wheel_odom_valid = true;
+}
+
 void poll_can_feedback()
 {
   while (CAN.available())
@@ -180,6 +243,16 @@ void poll_can_feedback()
     if (msg.isStandardId() && msg.getStandardId() == AMIGA_TPDO1_CAN_ID && msg.data_length >= 1)
     {
       g_vcu_state = msg.data[0];
+
+      // Bytes 1-4: measured_speed (int16 mm/s) and measured_ang_rate (int16 mrad/s), little
+      // endian -- same AmigaTpdo1 wire layout as the AmigaRpdo1 command encoded in
+      // send_amiga_rpdo1() above, mirrored back by the VCU.
+      if (msg.data_length >= 5)
+      {
+        int16_t const meas_speed_mm_s = static_cast<int16_t>(msg.data[1] | (static_cast<uint16_t>(msg.data[2]) << 8));
+        int16_t const meas_ang_mrad_s = static_cast<int16_t>(msg.data[3] | (static_cast<uint16_t>(msg.data[4]) << 8));
+        integrate_wheel_odometry(meas_speed_mm_s / 1000.0f, meas_ang_mrad_s / 1000.0f);
+      }
     }
   }
 }
@@ -261,6 +334,32 @@ void imu_timer_callback(rcl_timer_t * timer, int64_t last_call_time)
   imu_msg.linear_acceleration.z = g_imu_az;
 
   RCSOFTCHECK(rcl_publish(&imu_publisher, &imu_msg, NULL));
+}
+
+// Timer callback (added to the executor below): publishes the dead-reckoned pose and the
+// VCU's measured body velocity at a fixed rate. See the WHEEL_ODOM_* comments above regarding
+// why the pose covariance is deliberately pessimistic.
+void wheel_odom_timer_callback(rcl_timer_t * timer, int64_t last_call_time)
+{
+  (void)last_call_time;
+  if (timer == NULL || !g_wheel_odom_valid)
+  {
+    return;
+  }
+
+  int64_t const now_ns = rmw_uros_epoch_nanos();
+  wheel_odom_msg.header.stamp.sec = static_cast<int32_t>(now_ns / 1000000000LL);
+  wheel_odom_msg.header.stamp.nanosec = static_cast<uint32_t>(now_ns % 1000000000LL);
+
+  wheel_odom_msg.pose.pose.position.x = g_odom_x;
+  wheel_odom_msg.pose.pose.position.y = g_odom_y;
+  wheel_odom_msg.pose.pose.orientation.z = sin(g_odom_theta * 0.5);
+  wheel_odom_msg.pose.pose.orientation.w = cos(g_odom_theta * 0.5);
+
+  wheel_odom_msg.twist.twist.linear.x = g_meas_linear_mps;
+  wheel_odom_msg.twist.twist.angular.z = g_meas_angular_rps;
+
+  RCSOFTCHECK(rcl_publish(&wheel_odom_publisher, &wheel_odom_msg, NULL));
 }
 
 // --- micro-ROS custom UDP transport over the Portenta's wired Ethernet ---
@@ -369,12 +468,17 @@ bool create_entities()
       &imu_publisher, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, Imu), "imu/data"));
   RCCHECK(rclc_timer_init_default2(
       &imu_timer, &support, RCL_MS_TO_NS(IMU_PUBLISH_INTERVAL_MS), &imu_timer_callback, true));
+  RCCHECK(rclc_publisher_init_default(
+      &wheel_odom_publisher, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(nav_msgs, msg, Odometry), "wheel/odometry"));
+  RCCHECK(rclc_timer_init_default2(
+      &wheel_odom_timer, &support, RCL_MS_TO_NS(WHEEL_ODOM_PUBLISH_INTERVAL_MS), &wheel_odom_timer_callback, true));
 
   executor = rclc_executor_get_zero_initialized_executor();
-  RCCHECK(rclc_executor_init(&executor, &support.context, 2, &allocator));
+  RCCHECK(rclc_executor_init(&executor, &support.context, 3, &allocator));
   RCCHECK(
       rclc_executor_add_subscription(&executor, &cmd_vel_subscriber, &cmd_vel_msg, &cmd_vel_callback, ON_NEW_DATA));
   RCCHECK(rclc_executor_add_timer(&executor, &imu_timer));
+  RCCHECK(rclc_executor_add_timer(&executor, &wheel_odom_timer));
 
   // Best-effort; a synced epoch just makes imu_msg.header.stamp meaningful, it's not required
   // for the bridge to function.
@@ -394,6 +498,8 @@ void destroy_entities()
   rcl_subscription_fini(&cmd_vel_subscriber, &node);
   rcl_publisher_fini(&imu_publisher, &node);
   rcl_timer_fini(&imu_timer);
+  rcl_publisher_fini(&wheel_odom_publisher, &node);
+  rcl_timer_fini(&wheel_odom_timer);
   rclc_executor_fini(&executor);
   rcl_node_fini(&node);
   rclc_support_fini(&support);
@@ -438,6 +544,30 @@ void setup()
   imu_msg.linear_acceleration_covariance[0] = IMU_LINEAR_ACCELERATION_VARIANCE;
   imu_msg.linear_acceleration_covariance[4] = IMU_LINEAR_ACCELERATION_VARIANCE;
   imu_msg.linear_acceleration_covariance[8] = IMU_LINEAR_ACCELERATION_VARIANCE;
+
+  // Same idea for wheel_odom_msg. 6x6 row-major covariance: diagonal entries are indices
+  // 0/7/14/21/28/35 for x/y/z/roll/pitch/yaw (pose) or vx/vy/vz/roll_rate/pitch_rate/yaw_rate
+  // (twist). z/roll/pitch(_rate) are constrained ~0 by the planar, no-side-slip assumption;
+  // x/y/yaw pose is an unbounded-drift dead-reckoning estimate (see WHEEL_ODOM_* comments above).
+  wheel_odom_msg.header.frame_id = micro_ros_string_utilities_init("odom");
+  wheel_odom_msg.child_frame_id = micro_ros_string_utilities_init("base_link");
+  for (size_t i = 0; i < 36; ++i)
+  {
+    wheel_odom_msg.pose.covariance[i] = 0.0;
+    wheel_odom_msg.twist.covariance[i] = 0.0;
+  }
+  wheel_odom_msg.pose.covariance[0] = WHEEL_ODOM_POSE_XY_YAW_VARIANCE;  // x
+  wheel_odom_msg.pose.covariance[7] = WHEEL_ODOM_POSE_XY_YAW_VARIANCE;  // y
+  wheel_odom_msg.pose.covariance[14] = WHEEL_ODOM_CONSTRAINED_VARIANCE; // z
+  wheel_odom_msg.pose.covariance[21] = WHEEL_ODOM_CONSTRAINED_VARIANCE; // roll
+  wheel_odom_msg.pose.covariance[28] = WHEEL_ODOM_CONSTRAINED_VARIANCE; // pitch
+  wheel_odom_msg.pose.covariance[35] = WHEEL_ODOM_POSE_XY_YAW_VARIANCE; // yaw
+  wheel_odom_msg.twist.covariance[0] = WHEEL_ODOM_LINEAR_X_VARIANCE;      // vx
+  wheel_odom_msg.twist.covariance[7] = WHEEL_ODOM_CONSTRAINED_VARIANCE;   // vy
+  wheel_odom_msg.twist.covariance[14] = WHEEL_ODOM_CONSTRAINED_VARIANCE;  // vz
+  wheel_odom_msg.twist.covariance[21] = WHEEL_ODOM_CONSTRAINED_VARIANCE;  // roll rate
+  wheel_odom_msg.twist.covariance[28] = WHEEL_ODOM_CONSTRAINED_VARIANCE;  // pitch rate
+  wheel_odom_msg.twist.covariance[35] = WHEEL_ODOM_ANGULAR_Z_VARIANCE;    // yaw rate
 
   g_state = WAITING_AGENT;
 }

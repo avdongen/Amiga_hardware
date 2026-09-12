@@ -50,7 +50,8 @@
 static IPAddress const PORTENTA_IP(10, 95, 76, 6);
 static IPAddress const PORTENTA_SUBNET(255, 255, 255, 0);
 static IPAddress const PORTENTA_GATEWAY(10, 95, 76, 254);
-static IPAddress const MICRO_ROS_AGENT_IP(10, 95, 76, 165);
+static IPAddress const MICRO_ROS_AGENT_IP(10, 95, 76, 165); // amiga
+//static IPAddress const MICRO_ROS_AGENT_IP(10, 95, 76, 151); // andries-HP-ZBook
 static uint16_t constexpr MICRO_ROS_AGENT_PORT = 8889;
 
 // Returns false (rather than hanging in error_loop()) so a failed create_entities() is
@@ -107,6 +108,16 @@ static double constexpr WHEEL_ODOM_MAX_VALID_DT_S = 1.0; // guards against milli
 static double constexpr WHEEL_ODOM_LINEAR_X_VARIANCE = 0.0025;
 static double constexpr WHEEL_ODOM_ANGULAR_Z_VARIANCE = 0.0009;
 static double constexpr WHEEL_ODOM_CONSTRAINED_VARIANCE = 1.0e-6;
+
+// The Amiga is 4-wheel skid-steered: turning scrubs the wheels sideways against the ground
+// instead of steering them, so the faster it's commanded to turn, the more the wheel-speed-
+// derived vx/yaw-rate estimate above departs from the true body velocity. There's no wheel
+// slip sensor to measure this directly, so it's approximated from the commanded turn rate
+// (g_angular_z, already available every /cmd_vel message, rather than waiting on the VCU's own
+// -- already slip-corrupted -- measured turn rate) and added on top of the baseline variance,
+// growing with the square of angular rate as is typical for skid-steer slip models.
+static double constexpr WHEEL_ODOM_SLIP_LINEAR_VARIANCE_PER_RAD2_S2 = 0.02;
+static double constexpr WHEEL_ODOM_SLIP_ANGULAR_VARIANCE_PER_RAD2_S2 = 0.01;
 
 // The integrated x/y/yaw pose drifts unboundedly with distance travelled (no absolute
 // reference), so its covariance below is deliberately pessimistic. Feed this into
@@ -359,6 +370,13 @@ void wheel_odom_timer_callback(rcl_timer_t * timer, int64_t last_call_time)
   wheel_odom_msg.twist.twist.linear.x = g_meas_linear_mps;
   wheel_odom_msg.twist.twist.angular.z = g_meas_angular_rps;
 
+  // Inflate vx/yaw-rate variance with commanded turn rate to account for skid-steer wheel
+  // slip in corners -- see WHEEL_ODOM_SLIP_* comments above.
+  double const cmd_angular_z = g_angular_z;
+  double const slip_variance = cmd_angular_z * cmd_angular_z;
+  wheel_odom_msg.twist.covariance[0] = WHEEL_ODOM_LINEAR_X_VARIANCE + WHEEL_ODOM_SLIP_LINEAR_VARIANCE_PER_RAD2_S2 * slip_variance;
+  wheel_odom_msg.twist.covariance[35] = WHEEL_ODOM_ANGULAR_Z_VARIANCE + WHEEL_ODOM_SLIP_ANGULAR_VARIANCE_PER_RAD2_S2 * slip_variance;
+
   RCSOFTCHECK(rcl_publish(&wheel_odom_publisher, &wheel_odom_msg, NULL));
 }
 
@@ -562,12 +580,12 @@ void setup()
   wheel_odom_msg.pose.covariance[21] = WHEEL_ODOM_CONSTRAINED_VARIANCE; // roll
   wheel_odom_msg.pose.covariance[28] = WHEEL_ODOM_CONSTRAINED_VARIANCE; // pitch
   wheel_odom_msg.pose.covariance[35] = WHEEL_ODOM_POSE_XY_YAW_VARIANCE; // yaw
-  wheel_odom_msg.twist.covariance[0] = WHEEL_ODOM_LINEAR_X_VARIANCE;      // vx
+  // vx (index 0) and yaw rate (index 35) are set per-publish in wheel_odom_timer_callback()
+  // instead, since they grow with commanded turn rate -- see WHEEL_ODOM_SLIP_* comments above.
   wheel_odom_msg.twist.covariance[7] = WHEEL_ODOM_CONSTRAINED_VARIANCE;   // vy
   wheel_odom_msg.twist.covariance[14] = WHEEL_ODOM_CONSTRAINED_VARIANCE;  // vz
   wheel_odom_msg.twist.covariance[21] = WHEEL_ODOM_CONSTRAINED_VARIANCE;  // roll rate
   wheel_odom_msg.twist.covariance[28] = WHEEL_ODOM_CONSTRAINED_VARIANCE;  // pitch rate
-  wheel_odom_msg.twist.covariance[35] = WHEEL_ODOM_ANGULAR_Z_VARIANCE;    // yaw rate
 
   g_state = WAITING_AGENT;
 }

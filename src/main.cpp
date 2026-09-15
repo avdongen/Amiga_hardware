@@ -13,22 +13,15 @@
 //  - The Amiga must first be armed into Auto Mode from the physical dashboard/pendant.
 //    Until the VCU reports STATE_AUTO_ACTIVE over CAN, this node keeps commanding zero
 //    speed even though it continuously requests STATE_AUTO_ACTIVE.
-//  - Requires a carrier with wired Ethernet (e.g. Portenta Mid Carrier / Machine Control).
-//    Connect a micro-ROS agent reachable on the same network, e.g.:
-//      ros2 run micro_ros_agent micro_ros_agent udp4 --port 8888
-//
-// micro_ros_platformio ships a ready-made "ethernet" transport, but it's hard-wired to the
-// ESP32 (ETH.h + WiFi.h) and won't build for the Portenta. board_microros_transport is set
-// to "custom" below and the UDP transport is implemented here instead, using the Portenta's
-// own Ethernet/EthernetUDP classes -- same approach as micro_ros_platformio's own wifi
-// transport, just swapped onto a wired interface.
+//  - The Portenta's USB port carries the micro-ROS transport (board_microros_transport =
+//    serial in platformio.ini). Connect it to the host running the micro-ROS agent, e.g.:
+//      ros2 run micro_ros_agent micro_ros_agent serial --dev /dev/ttyACM0 -b 115200
 //
 // CAN protocol reference: farm-ng/farm-ng-amiga, py/farm_ng/canbus/packet.py
 // (AmigaRpdo1 / AmigaTpdo1, CANopen PDO cob-ids offset by the dashboard node id).
 
 #include <Arduino.h>
 #include <Arduino_CAN.h>
-#include <Ethernet.h>
 #include <Wire.h>
 #include <Adafruit_BNO08x.h>
 
@@ -39,20 +32,11 @@
 #include <rclc/executor.h>
 #include <rmw_microros/rmw_microros.h>
 #include <uxr/client/util/time.h>
-#include <uxr/client/profile/transport/custom/custom_transport.h>
 #include <micro_ros_utilities/string_utilities.h>
 
 #include <geometry_msgs/msg/twist.h>
 #include <sensor_msgs/msg/imu.h>
 #include <nav_msgs/msg/odometry.h>
-
-// --- Network configuration ---
-static IPAddress const PORTENTA_IP(10, 95, 76, 6);
-static IPAddress const PORTENTA_SUBNET(255, 255, 255, 0);
-static IPAddress const PORTENTA_GATEWAY(10, 95, 76, 254);
-static IPAddress const MICRO_ROS_AGENT_IP(10, 95, 76, 165); // amiga
-//static IPAddress const MICRO_ROS_AGENT_IP(10, 95, 76, 151); // andries-HP-ZBook
-static uint16_t constexpr MICRO_ROS_AGENT_PORT = 8889;
 
 // Returns false (rather than hanging in error_loop()) so a failed create_entities() is
 // simply retried by the WAITING_AGENT/AGENT_AVAILABLE reconnection state machine below.
@@ -380,97 +364,6 @@ void wheel_odom_timer_callback(rcl_timer_t * timer, int64_t last_call_time)
   RCSOFTCHECK(rcl_publish(&wheel_odom_publisher, &wheel_odom_msg, NULL));
 }
 
-// --- micro-ROS custom UDP transport over the Portenta's wired Ethernet ---
-struct micro_ros_agent_locator
-{
-  IPAddress address;
-  int port;
-};
-
-static EthernetUDP udp_client;
-
-extern "C" {
-
-bool platformio_transport_open(struct uxrCustomTransport * transport)
-{
-  struct micro_ros_agent_locator * locator = reinterpret_cast<struct micro_ros_agent_locator *>(transport->args);
-  return udp_client.begin(locator->port) == 1;
-}
-
-bool platformio_transport_close(struct uxrCustomTransport * transport)
-{
-  (void)transport;
-  udp_client.stop();
-  return true;
-}
-
-size_t platformio_transport_write(
-    struct uxrCustomTransport * transport, const uint8_t * buf, size_t len, uint8_t * errcode)
-{
-  struct micro_ros_agent_locator * locator = reinterpret_cast<struct micro_ros_agent_locator *>(transport->args);
-
-  size_t sent = 0;
-  if (udp_client.beginPacket(locator->address, locator->port))
-  {
-    sent = udp_client.write(buf, len);
-    sent = udp_client.endPacket() ? sent : 0;
-  }
-  udp_client.flush();
-
-  *errcode = (sent == len) ? 0 : 1;
-  return sent;
-}
-
-size_t platformio_transport_read(
-    struct uxrCustomTransport * transport, uint8_t * buf, size_t len, int timeout, uint8_t * errcode)
-{
-  (void)transport;
-
-  int64_t const start_time = uxr_millis();
-  while ((uxr_millis() - start_time) < static_cast<int64_t>(timeout) && udp_client.parsePacket() == 0)
-  {
-    delay(1);
-  }
-
-  size_t available = 0;
-  if (udp_client.available())
-  {
-    available = udp_client.read(buf, len);
-  }
-
-  *errcode = (available > 0) ? 0 : 1;
-  return available;
-}
-
-} // extern "C"
-
-// Brings up the wired Ethernet link with the static address above and registers the UDP
-// transport with micro-ROS. Runs once from setup(); the reconnection state machine in
-// loop() only needs to (re)create rcl entities afterwards, not redo the network config.
-void setup_micro_ros_transport()
-{
-  Ethernet.begin(nullptr, PORTENTA_IP, PORTENTA_GATEWAY, PORTENTA_GATEWAY, PORTENTA_SUBNET);
-
-  unsigned long const link_wait_start = millis();
-  while (Ethernet.linkStatus() != LinkON && (millis() - link_wait_start) < 5000)
-  {
-    delay(100);
-  }
-
-  Serial.print("Ethernet link: ");
-  Serial.println(Ethernet.linkStatus() == LinkON ? "UP" : "DOWN (continuing anyway)");
-  Serial.print("Portenta IP: ");
-  Serial.println(PORTENTA_IP);
-
-  static struct micro_ros_agent_locator locator;
-  locator.address = MICRO_ROS_AGENT_IP;
-  locator.port = MICRO_ROS_AGENT_PORT;
-
-  rmw_uros_set_custom_transport(
-      false, reinterpret_cast<void *>(&locator), platformio_transport_open, platformio_transport_close,
-      platformio_transport_write, platformio_transport_read);
-}
-
 // Brings up node/subscription/executor against the currently available agent.
 // Returns false (via RCCHECK) on any failure, leaving cleanup to destroy_entities().
 bool create_entities()
@@ -530,7 +423,7 @@ void setup()
 
   pinMode(LED_BUILTIN, OUTPUT);
 
-  setup_micro_ros_transport();
+  set_microros_serial_transports(Serial);
 
   if (!CAN.begin(CanBitRate::BR_250k))
   {
